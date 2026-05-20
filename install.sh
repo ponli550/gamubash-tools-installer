@@ -42,8 +42,13 @@
 # script (it's the kind of thing they'll be writing during Module 9).
 #
 # Override env vars:
-#   GAMUBASH_REPO_URL       — git remote (default: ponli550/GamuBash)
-#   GAMUBASH_RELEASE_REPO   — owner/name slug for release downloads
+#   GAMUBASH_REPO_URL       — git remote for the source/curriculum
+#                             (default: github.com/ponli550/GamuBash.git)
+#   GAMUBASH_RELEASE_REPO   — owner/name slug on github.com hosting the prebuilt
+#                             binary releases. Decoupled from GAMUBASH_REPO_URL,
+#                             so you can host source on Bitbucket while still
+#                             pulling release tarballs from a public GitHub
+#                             mirror (default: ponli550/gamubash-tools-installer)
 #   GAMUBASH_FORCE_SOURCE=1 — skip the binary fast-path; always build from source
 #   GAMUBASH_NO_PATH_EDIT=1 — skip editing your shell rc; just print instructions
 #   GAMUBASH_ALLOW_GIT_PROMPT=1 — allow git to prompt for HTTPS auth (default:
@@ -63,10 +68,71 @@ GO_INSTALL_VERSION="1.23.4"  # bump occasionally; minimum the curriculum needs
 # Override-able for forks/testing: GAMUBASH_REPO_URL=... bash install.sh
 REPO_URL="${GAMUBASH_REPO_URL:-https://github.com/ponli550/GamuBash.git}"
 RELEASE_REPO="${GAMUBASH_RELEASE_REPO:-ponli550/gamubash-tools-installer}"
+
+# Derive host, SSH form, and web URL from REPO_URL so the release-binary host
+# gate and error messages adapt to any forge (github, bitbucket, gitlab, …).
+# Without this, `curl https://bitbucket.org/.../install.sh | bash` would still
+# hit api.github.com and print github.com URLs in every error message, even
+# though the user explicitly pointed the installer at Bitbucket.
+REPO_HOST=""
+REPO_SSH=""
+REPO_WEB=""
+case "$REPO_URL" in
+  https://*|http://*)
+    _rest="${REPO_URL#*://}"
+    REPO_HOST="${_rest%%/*}"
+    REPO_SSH="git@${REPO_HOST}:${_rest#*/}"
+    REPO_WEB="${REPO_URL%.git}"
+    unset _rest
+    ;;
+  *@*:*)
+    REPO_HOST="${REPO_URL#*@}"
+    REPO_HOST="${REPO_HOST%%:*}"
+    REPO_SSH="$REPO_URL"
+    REPO_WEB="https://${REPO_HOST}/${REPO_URL##*:}"
+    REPO_WEB="${REPO_WEB%.git}"
+    ;;
+  *)
+    REPO_SSH="$REPO_URL"
+    REPO_WEB="$REPO_URL"
+    ;;
+esac
+
 SRC_DIR="${HOME}/.gamubash/src"
 BIN_DIR="${HOME}/.local/bin"
 BIN_NAME="gamubash"
 GO_INSTALL_DIR="${HOME}/.local/go"
+
+# ── cleanup registry ──────────────────────────────────────────────────────────
+# Functions register tmp dirs here so the EXIT/INT/TERM trap below cleans them
+# up even on Ctrl-C. The previous design relied on per-function RETURN traps,
+# which leaked tmp dirs when the script was aborted mid-download.
+TMP_DIRS=()
+cleanup_tmp_dirs() {
+  if [ "${#TMP_DIRS[@]}" -eq 0 ]; then
+    return
+  fi
+  local d
+  for d in "${TMP_DIRS[@]}"; do
+    [ -n "$d" ] && rm -rf "$d"
+  done
+}
+trap cleanup_tmp_dirs EXIT INT TERM
+
+# Set by ensure_on_path() when it appends a PATH export to the user's rc file.
+# print_next_steps reads this to surface the `source <rc>` reminder prominently
+# at the end of output (otherwise it scrolls past under release/build output).
+PATH_RC_EDITED=""
+
+# Guard so `apt-get update` runs at most once per --tools-only invocation,
+# instead of once per apt_pkg call (6 redundant refreshes in the worst case).
+APT_UPDATED=0
+
+# Captured when the release-binary fast-path bails. print_manual_install_and_die
+# surfaces this so a user who lands on the manual screen understands WHY the
+# automated path didn't work and whether re-running later might help (e.g.
+# "no release yet" = wait for mirror; "rate limited" = set GITHUB_TOKEN).
+RELEASE_FAIL_REASON=""
 
 # ── styled output ─────────────────────────────────────────────────────────────
 if [ -t 1 ]; then
@@ -171,19 +237,54 @@ try_install_from_release() {
   goos="${platform%-*}"   # darwin or linux
   goarch="${platform#*-}" # amd64 or arm64
 
+  # Release-binary path always hits GitHub Releases on RELEASE_REPO, regardless
+  # of where the source/curriculum (REPO_URL) is hosted. This lets us host
+  # source on Bitbucket while publishing prebuilt binaries on a public GitHub
+  # mirror (default: ponli550/gamubash-tools-installer). Override with
+  # GAMUBASH_RELEASE_REPO; disable entirely with GAMUBASH_FORCE_SOURCE=1.
   say "checking for a release binary for ${platform}"
   local api="https://api.github.com/repos/${RELEASE_REPO}/releases/latest"
-  local release_json
-  release_json="$(curl -fsSL "$api" 2>/dev/null)" || {
-    warn "no published release on ${RELEASE_REPO} yet — falling back to source build"
+  local release_json=""
+  # Use GITHUB_TOKEN when set — bumps the rate limit from 60/hr to 5000/hr.
+  # Useful in CI and for users who hit the unauthenticated limit mid-session.
+  if [ -n "${GITHUB_TOKEN:-}" ]; then
+    release_json="$(curl -fsSL -H "Authorization: Bearer ${GITHUB_TOKEN}" "$api" 2>/dev/null || true)"
+  else
+    release_json="$(curl -fsSL "$api" 2>/dev/null || true)"
+  fi
+  if [ -z "$release_json" ]; then
+    # Distinguish rate limit (403) from "no releases yet" (404) by re-fetching
+    # without -f so we can read the error body. Costs one extra request only
+    # in the failure path.
+    local err_body
+    err_body="$(curl -sSL "$api" 2>/dev/null || true)"
+    if echo "$err_body" | grep -q "API rate limit exceeded"; then
+      RELEASE_FAIL_REASON="GitHub API rate limited (60/hr unauthenticated) — set GITHUB_TOKEN or wait"
+    else
+      RELEASE_FAIL_REASON="no published release on ${RELEASE_REPO} yet"
+    fi
+    warn "${RELEASE_FAIL_REASON}; falling back to source build"
     return 1
-  }
+  fi
 
   local tag asset_url checksum_url
   tag="$(echo "$release_json" | grep -m1 '"tag_name"' | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')"
   # Asset name template matches goreleaser: gamubash_<ver>_<os>_<arch>.tar.gz
   # The version in the asset name is the tag with the leading 'v' stripped.
   local version="${tag#v}"
+
+  # Skip the download entirely if the installed binary already reports this
+  # version. Best-effort: if --version isn't supported or its output format
+  # changes, we just re-install (harmless — this script is idempotent).
+  if [ -x "${BIN_DIR}/${BIN_NAME}" ]; then
+    local current
+    current="$("${BIN_DIR}/${BIN_NAME}" --version 2>/dev/null || true)"
+    if [ -n "$current" ] && echo "$current" | grep -qF "$version"; then
+      say "already at ${tag} — nothing to do"
+      return 0
+    fi
+  fi
+
   local asset="gamubash_${version}_${goos}_${goarch}.tar.gz"
   asset_url="$(echo "$release_json" | grep -m1 "\"browser_download_url\":.*${asset}\"" | \
     sed 's/.*"browser_download_url": *"\([^"]*\)".*/\1/')"
@@ -191,21 +292,23 @@ try_install_from_release() {
     sed 's/.*"browser_download_url": *"\([^"]*\)".*/\1/')"
 
   if [ -z "$asset_url" ]; then
-    warn "no asset matching ${asset} in release ${tag} — falling back to source build"
+    RELEASE_FAIL_REASON="release ${tag} on ${RELEASE_REPO} has no asset for your platform (${platform})"
+    warn "${RELEASE_FAIL_REASON}; falling back to source build"
     return 1
   fi
 
   say "downloading release ${tag} (${asset})"
   local tmp
   tmp="$(mktemp -d -t gamubash-XXXXXX)"
-  # macOS ships bash 3.2, which leaks RETURN traps to the caller's scope.
-  # Use double quotes so $tmp is baked into the trap command at registration
-  # time — when the trap re-fires from main()'s return, it doesn't need to
-  # look up an out-of-scope variable (would trip set -u with "unbound").
-  trap "rm -rf \"$tmp\"" RETURN
+  # Register tmp dir in the global cleanup list so the EXIT/INT/TERM trap
+  # removes it — covers Ctrl-C, kill, and normal exit. Replaces the previous
+  # RETURN trap, which (a) didn't fire on signals and (b) had a bash 3.2 quirk
+  # where it leaked to the caller's scope and tripped set -u on re-fire.
+  TMP_DIRS+=("$tmp")
 
   curl -fsSL "$asset_url" -o "$tmp/${asset}" || {
-    warn "download failed — falling back to source build"
+    RELEASE_FAIL_REASON="download of ${asset} from ${RELEASE_REPO} failed (network or transient outage)"
+    warn "${RELEASE_FAIL_REASON}; falling back to source build"
     return 1
   }
 
@@ -221,7 +324,11 @@ try_install_from_release() {
       elif command -v sha256sum >/dev/null 2>&1; then
         actual="$(sha256sum "$tmp/${asset}" | awk '{print $1}')"
       else
+        warn "no sha256 utility (shasum/sha256sum) found — integrity check SKIPPED"
         actual=""
+      fi
+      if [ -z "$expected" ]; then
+        warn "asset ${asset} not listed in checksums.txt — integrity check SKIPPED"
       fi
       if [ -n "$expected" ] && [ -n "$actual" ] && [ "$expected" != "$actual" ]; then
         die "checksum mismatch on ${asset} — refusing to install (got ${actual}, expected ${expected})"
@@ -252,16 +359,37 @@ try_install_from_release() {
 # install fell over.
 print_manual_install_and_die() {
   warn "$1"
+  # Surface the release-fast-path failure if it was set. Helps a stranded user
+  # diagnose whether re-running is likely to help (rate-limit / network blip)
+  # or whether they really do need to manual-install (no release published).
+  if [ -n "$RELEASE_FAIL_REASON" ]; then
+    warn ""
+    warn "release fast-path also failed:"
+    warn "  ${RELEASE_FAIL_REASON}"
+    case "$RELEASE_FAIL_REASON" in
+      *"no published release"*)
+        warn "  → the public mirror likely hasn't run yet — try again in a few minutes" ;;
+      *"rate limited"*)
+        warn "  → set GITHUB_TOKEN (any read-scoped PAT) and re-run, or wait an hour" ;;
+      *"no asset for your platform"*)
+        warn "  → this release lacks a binary for your platform — try source build" ;;
+      *"download"*"failed"*)
+        warn "  → network or transient outage — re-running the installer may succeed" ;;
+    esac
+  fi
   warn ""
   warn "to install manually, pick one:"
+  # Release binaries always live on GitHub at RELEASE_REPO, independent of
+  # where REPO_URL points (so a Bitbucket-hosted source repo still gets
+  # prebuilt binaries from the public GitHub releases page).
   warn "  • download a release binary by hand:"
   warn "      https://github.com/${RELEASE_REPO}/releases"
   warn "      drop the gamubash binary into ${BIN_DIR}/${BIN_NAME}, chmod +x"
   warn "  • OR build from source via SSH (bypasses HTTPS credential helpers):"
-  warn "      git clone git@github.com:${RELEASE_REPO}.git ${SRC_DIR}"
+  warn "      git clone ${REPO_SSH} ${SRC_DIR}"
   warn "      cd ${SRC_DIR}/cli && go build -o ${BIN_DIR}/${BIN_NAME} ./cmd/gamubash"
   warn "  • OR fix the credential helper and re-run this installer:"
-  warn "      printf 'protocol=https\\nhost=github.com\\n' | git credential-osxkeychain erase"
+  warn "      printf 'protocol=https\\nhost=${REPO_HOST:-github.com}\\n' | git credential-osxkeychain erase"
   die "automated install couldn't complete"
 }
 
@@ -280,8 +408,14 @@ clone_or_update() {
     say "updating existing checkout at ${SRC_DIR}"
     git -C "$SRC_DIR" fetch --quiet origin || \
       print_manual_install_and_die "git fetch failed for ${REPO_URL} — likely a stale credential helper sending bad creds."
-    git -C "$SRC_DIR" checkout --quiet main
-    git -C "$SRC_DIR" pull --quiet --ff-only origin main
+    # Resolve upstream's default branch from origin/HEAD instead of hard-coding
+    # "main". Forks may use "master"/"trunk", and upstream could be renamed.
+    # Falls back to "main" if symbolic-ref isn't set (older clones).
+    local default_branch
+    default_branch="$(git -C "$SRC_DIR" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||' || true)"
+    default_branch="${default_branch:-main}"
+    git -C "$SRC_DIR" checkout --quiet "$default_branch"
+    git -C "$SRC_DIR" pull --quiet --ff-only origin "$default_branch"
   else
     say "cloning ${REPO_URL} → ${SRC_DIR}"
     mkdir -p "$(dirname "$SRC_DIR")"
@@ -292,9 +426,15 @@ clone_or_update() {
 
 build_and_install() {
   say "building gamubash"
-  (cd "${SRC_DIR}/cli" && go build -o "/tmp/${BIN_NAME}.$$" ./cmd/gamubash)
+  # mktemp + cleanup registry: avoids the predictable /tmp/$BIN.$$ path
+  # (race-prone across concurrent runs and trivially predictable to other
+  # users on shared hosts). Registry pickup means an aborted build cleans up.
+  local tmp
+  tmp="$(mktemp -d -t gamubash-build-XXXXXX)"
+  TMP_DIRS+=("$tmp")
+  (cd "${SRC_DIR}/cli" && go build -o "${tmp}/${BIN_NAME}" ./cmd/gamubash)
   mkdir -p "$BIN_DIR"
-  mv "/tmp/${BIN_NAME}.$$" "${BIN_DIR}/${BIN_NAME}"
+  mv "${tmp}/${BIN_NAME}" "${BIN_DIR}/${BIN_NAME}"
   chmod +x "${BIN_DIR}/${BIN_NAME}"
   say "installed → ${BIN_DIR}/${BIN_NAME}"
 }
@@ -318,16 +458,23 @@ ensure_on_path() {
     return 0
   fi
 
-  local rc
-  case "$(basename "${SHELL:-/bin/zsh}")" in
+  local rc shell_name
+  shell_name="$(basename "${SHELL:-/bin/zsh}")"
+  case "$shell_name" in
     zsh)  rc="$HOME/.zshrc" ;;
     bash) rc="$HOME/.bashrc" ;;
+    fish) rc="$HOME/.config/fish/config.fish"; mkdir -p "$(dirname "$rc")" ;;
     *)    rc="$HOME/.profile" ;;
   esac
   touch "$rc"
 
   if grep -q '\.local/bin' "$rc" 2>/dev/null; then
     say "${rc} already references .local/bin — not modifying"
+  elif [ "$shell_name" = "fish" ]; then
+    # Fish doesn't read POSIX export syntax — use fish_add_path, which is the
+    # idiomatic and universal-variable-safe way to extend PATH in fish 3+.
+    printf '\n# added by gamubash installer\nfish_add_path %s\n' "$BIN_DIR" >> "$rc"
+    say "added ${BIN_DIR} to PATH in ${rc} (fish syntax)"
   else
     # SC2016: literal $PATH is intentional — it must expand at shell startup,
     # not at install time, otherwise we'd freeze the user's current PATH into
@@ -337,6 +484,7 @@ ensure_on_path() {
     say "added ${BIN_DIR} to PATH in ${rc}"
   fi
 
+  PATH_RC_EDITED="$rc"
   printf "    %sthis terminal:%s  source %s\n" "$C_BOLD" "$C_RESET" "$rc"
   printf "    %snew terminals:%s  already set\n" "$C_BOLD" "$C_RESET"
 }
@@ -351,12 +499,29 @@ tool_step() { printf "\n%s──%s %s\n" "$C_GREEN" "$C_RESET" "$1"; }
 tool_ok()   { printf "  %s✓%s %s\n" "$C_GREEN" "$C_RESET" "$1"; }
 tool_warn() { printf "  %s!%s %s (continuing)\n" "$C_YELLOW" "$C_RESET" "$1" >&2; }
 
+# Under `curl | bash`, stdin is the pipe, so sudo (and Homebrew's installer)
+# can't prompt for a password and bails. Cache the credential up-front by
+# reading from /dev/tty — same trick the pyenv prompt uses below. No-op when
+# already cached (or running as root), and returns non-zero when there's no
+# TTY at all (CI containers) or the user can't sudo (non-admin account).
+ensure_sudo_cached() {
+  if sudo -n true 2>/dev/null; then
+    return 0
+  fi
+  if [ ! -r /dev/tty ]; then
+    return 1
+  fi
+  say "caching sudo credentials (some installers need admin rights)"
+  sudo -v < /dev/tty
+}
+
 # Pick the trainee's rc file and shell flavor. Matches shellDetectPrologue in
 # doctor.go so hooks land in the same place either way.
 detect_rc() {
   case "$(basename "${SHELL:-/bin/zsh}")" in
     zsh)  RC="$HOME/.zshrc";   SH=zsh ;;
     bash) RC="$HOME/.bashrc";  SH=bash ;;
+    fish) RC="$HOME/.config/fish/config.fish"; SH=fish; mkdir -p "$(dirname "$RC")" ;;
     *)    RC="$HOME/.profile"; SH=bash ;;
   esac
   touch "$RC"
@@ -368,8 +533,34 @@ install_brew_mac() {
     tool_ok "brew already present: $(brew --version | head -n1)"
     return 0
   fi
-  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" \
+  ensure_sudo_cached || {
+    tool_warn "sudo unavailable — brew-dependent tools will be skipped"
+    return 1
+  }
+  NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" \
     || { tool_warn "brew install failed — brew-dependent tools will be skipped"; return 1; }
+
+  # Brew doesn't add itself to PATH on Apple Silicon — /opt/homebrew/bin isn't
+  # in the default $PATH. Without this, every later brew_pkg / install_docker /
+  # install_pyenv call in THIS script would see `brew missing` and skip. Also
+  # append the eval to the user's rc so future shells pick it up.
+  local brew_path=""
+  [ -x /opt/homebrew/bin/brew ] && brew_path=/opt/homebrew/bin/brew
+  [ -z "$brew_path" ] && [ -x /usr/local/bin/brew ] && brew_path=/usr/local/bin/brew
+  if [ -z "$brew_path" ]; then
+    tool_warn "brew installed but binary not found at /opt/homebrew or /usr/local"
+    return 1
+  fi
+  eval "$("$brew_path" shellenv)"
+  detect_rc
+  if ! grep -q 'brew shellenv' "$RC" 2>/dev/null; then
+    if [ "$SH" = "fish" ]; then
+      echo "$brew_path shellenv fish | source" >> "$RC"
+    else
+      echo "eval \"\$($brew_path shellenv)\"" >> "$RC"
+    fi
+  fi
+  tool_ok "brew installed; shellenv sourced and appended to $RC"
 }
 
 # Generic brew-install with idempotency. Usage: brew_pkg <binary> <pkg> [cask]
@@ -390,6 +581,15 @@ brew_pkg() {
   fi
 }
 
+# Runs `apt-get update` at most once per script invocation. Each apt_pkg /
+# install_pyenv call previously refreshed the package index independently — on
+# a clean Linux box with the full toolchain that's 6+ network round-trips for
+# no benefit. APT_UPDATED is initialized at the top of the file.
+apt_update_once() {
+  [ "$APT_UPDATED" = 1 ] && return 0
+  sudo apt-get update -qq && APT_UPDATED=1
+}
+
 apt_pkg() {
   local bin="$1" pkg="$2"
   tool_step "$bin"
@@ -397,7 +597,8 @@ apt_pkg() {
     tool_ok "$bin already present"
     return 0
   fi
-  sudo apt-get update -qq && sudo apt-get install -y "$pkg" \
+  apt_update_once
+  sudo apt-get install -y "$pkg" \
     || tool_warn "$bin (apt) install failed"
 }
 
@@ -413,10 +614,18 @@ install_direnv() {
   curl -sfL https://direnv.net/install.sh | bin_path="$HOME/.local/bin" bash \
     || { tool_warn "direnv install failed"; return 1; }
   if ! grep -q '\.local/bin' "$RC" 2>/dev/null; then
-    echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$RC"
+    if [ "$SH" = "fish" ]; then
+      echo 'fish_add_path $HOME/.local/bin' >> "$RC"
+    else
+      echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$RC"
+    fi
   fi
   if ! grep -q 'direnv hook' "$RC" 2>/dev/null; then
-    echo "eval \"\$(direnv hook $SH)\"" >> "$RC"
+    if [ "$SH" = "fish" ]; then
+      echo 'direnv hook fish | source' >> "$RC"
+    else
+      echo "eval \"\$(direnv hook $SH)\"" >> "$RC"
+    fi
   fi
   tool_ok "direnv installed to ~/.local/bin and hook appended to $RC"
 }
@@ -487,7 +696,7 @@ install_pyenv() {
       ;;
     linux-*)
       echo "  installing Python build deps via apt..."
-      sudo apt-get update -qq
+      apt_update_once
       sudo apt-get install -y build-essential libssl-dev zlib1g-dev \
         libbz2-dev libreadline-dev libsqlite3-dev libffi-dev liblzma-dev \
         || tool_warn "apt deps install failed"
@@ -496,15 +705,27 @@ install_pyenv() {
   curl https://pyenv.run | bash || { tool_warn "pyenv install failed"; return 1; }
   export PYENV_ROOT="${PYENV_ROOT:-$HOME/.pyenv}"
   if ! grep -q 'PYENV_ROOT' "$RC" 2>/dev/null; then
-    {
-      echo
-      echo "# pyenv"
-      echo 'export PYENV_ROOT="$HOME/.pyenv"'
-      echo '[[ -d $PYENV_ROOT/bin ]] && export PATH="$PYENV_ROOT/bin:$PATH"'
-      echo "eval \"\$(pyenv init - $SH)\""
-    } >> "$RC"
+    if [ "$SH" = "fish" ]; then
+      {
+        echo
+        echo "# pyenv"
+        echo 'set -gx PYENV_ROOT $HOME/.pyenv'
+        echo 'fish_add_path $PYENV_ROOT/bin'
+        echo 'pyenv init - fish | source'
+      } >> "$RC"
+    else
+      {
+        echo
+        echo "# pyenv"
+        echo 'export PYENV_ROOT="$HOME/.pyenv"'
+        echo '[[ -d $PYENV_ROOT/bin ]] && export PATH="$PYENV_ROOT/bin:$PATH"'
+        echo "eval \"\$(pyenv init - $SH)\""
+      } >> "$RC"
+    fi
   fi
   export PATH="$PYENV_ROOT/bin:$PATH"
+  # We're in bash regardless of the user's login shell — initialize pyenv in
+  # bash mode here so subsequent `pyenv install` calls in this script work.
   eval "$(pyenv init - bash)"
   echo
   echo "  About to compile Python 3.12 from source (3-5 min; skipped if already installed)."
@@ -532,12 +753,22 @@ install_gcloud() {
   export CLOUDSDK_INSTALL_DIR="$HOME"
   curl -fsSL https://sdk.cloud.google.com | bash \
     || { tool_warn "gcloud install failed"; return 1; }
+  # gcloud ships path.bash.inc/path.zsh.inc/path.fish.inc and matching
+  # completion files — pick the one that matches the user's shell.
   local inc="path.$SH.inc" comp="completion.$SH.inc"
   if ! grep -q "google-cloud-sdk/$inc" "$RC" 2>/dev/null; then
-    echo "source \"\$HOME/google-cloud-sdk/$inc\"" >> "$RC"
+    if [ "$SH" = "fish" ]; then
+      echo "source \$HOME/google-cloud-sdk/$inc" >> "$RC"
+    else
+      echo "source \"\$HOME/google-cloud-sdk/$inc\"" >> "$RC"
+    fi
   fi
   if ! grep -q "google-cloud-sdk/$comp" "$RC" 2>/dev/null; then
-    echo "source \"\$HOME/google-cloud-sdk/$comp\"" >> "$RC"
+    if [ "$SH" = "fish" ]; then
+      echo "source \$HOME/google-cloud-sdk/$comp" >> "$RC"
+    else
+      echo "source \"\$HOME/google-cloud-sdk/$comp\"" >> "$RC"
+    fi
   fi
   tool_ok "gcloud installed to ~/google-cloud-sdk — run 'gcloud init' after restart"
 }
@@ -563,6 +794,7 @@ install_toolchain() {
       ;;
     linux-*)
       warn "Linux support is best-effort — brew-only tools may be skipped"
+      ensure_sudo_cached || warn "sudo caching failed — apt/docker steps will likely fail"
       apt_pkg vim vim
       apt_pkg nvim neovim
       apt_pkg tmux tmux
@@ -591,7 +823,32 @@ main() {
       --scripts)    scripts_only=1; shift ;;
       --tools-only) tools_only=1; shift ;;
       -h|--help)
-        sed -n '2,/^$/p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//; s/^#$//'
+        # When $0 points to a real file (clone-first mode), parse the comment
+        # header. Under `curl | bash`, $0 is "bash" and the sed produces
+        # nothing — fall back to an inline summary so --help is never silent.
+        if [ -f "$0" ] && [ -r "$0" ]; then
+          sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//; s/^#$//'
+        else
+          cat <<HELP
+gamubash installer — ${REPO_WEB}
+
+flags:
+  --scripts     install Go + Make only (no gamubash binary)
+  --tools-only  install full dev toolchain (brew, vim, nvim, tmux, direnv,
+                jq, shellcheck, bats, docker, nvm+node+npm, pyenv+python3,
+                gcloud). Skips the gamubash binary.
+  --help, -h    show this help
+
+env overrides:
+  GAMUBASH_FORCE_SOURCE=1     skip the prebuilt-binary fast-path
+  GAMUBASH_NO_PATH_EDIT=1     don't touch your shell rc; just print PATH line
+  GAMUBASH_NO_GIT_AUTH=1      don't try the git-clone source-build fallback
+  GAMUBASH_ALLOW_GIT_PROMPT=1 let git prompt for HTTPS auth (private forks)
+  GITHUB_TOKEN=...            bump GitHub API rate limit (60/hr → 5000/hr)
+
+re-run the same command at any time to update (idempotent).
+HELP
+        fi
         return 0 ;;
       *) die "unknown flag: $1 (try --help)" ;;
     esac
@@ -665,6 +922,12 @@ print_next_steps() {
   printf "  1. %sgamubash doctor%s   — see which training tools are missing\n" "$C_BOLD" "$C_RESET"
   printf "  2. %sgamubash whoami%s   — verify your push permission\n" "$C_BOLD" "$C_RESET"
   printf "  3. %sgamubash%s          — start the training\n" "$C_BOLD" "$C_RESET"
+  if [ -n "${PATH_RC_EDITED:-}" ]; then
+    # Surface the `source <rc>` callout last so it doesn't scroll past under
+    # release-download output. Without this, users would tab to a new terminal
+    # before realizing they could refresh PATH in the current one.
+    printf "\n  %s↳ this terminal needs:%s %ssource %s%s\n" "$C_YELLOW" "$C_RESET" "$C_BOLD" "$PATH_RC_EDITED" "$C_RESET"
+  fi
   printf "\n  to update: re-run the curl|bash command above (this script is idempotent)\n"
 }
 
@@ -672,9 +935,12 @@ print_next_steps_scripts() {
   printf "\n%s✓ done.%s scripts-only setup complete.\n" "$C_GREEN" "$C_RESET"
   printf "  Go + Make installed; no gamubash binary was built.\n"
   printf "  next steps:\n"
-  printf "  1. clone the curriculum if you haven't: %sgit clone https://github.com/%s.git%s\n" "$C_BOLD" "${RELEASE_REPO}" "$C_RESET"
+  printf "  1. clone the curriculum if you haven't: %sgit clone %s%s\n" "$C_BOLD" "${REPO_URL}" "$C_RESET"
   printf "  2. follow modules in %s./modules/%s\n" "$C_BOLD" "$C_RESET"
   printf "  3. add the gamubash CLI later: %s./scripts/install.sh%s (no --scripts)\n" "$C_BOLD" "$C_RESET"
+  if [ -n "${PATH_RC_EDITED:-}" ]; then
+    printf "\n  %s↳ this terminal needs:%s %ssource %s%s\n" "$C_YELLOW" "$C_RESET" "$C_BOLD" "$PATH_RC_EDITED" "$C_RESET"
+  fi
 }
 
 main "$@"
